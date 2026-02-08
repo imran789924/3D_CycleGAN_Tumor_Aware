@@ -1,3 +1,5 @@
+import os
+import sys
 import torch
 import itertools
 import random
@@ -74,6 +76,31 @@ class CycleGANModel(BaseModel):
             visual_names_A.append('idt_A')
             visual_names_B.append('idt_B')
 
+        # Optional: pretrained frozen UNet for tumor prediction on fake_B
+        self.netSeg = None
+        if getattr(opt, 'unet_checkpoint', None) and os.path.isfile(opt.unet_checkpoint):
+            _proj_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            if _proj_root not in sys.path:
+                sys.path.insert(0, _proj_root)
+            from unet_tumor_segmentation.model import build_unet
+            ckpt = torch.load(opt.unet_checkpoint, map_location=self.device)
+            patch_size = ckpt.get('patch_size', getattr(opt, 'patch_size', [128, 128, 64]))
+            patch_size = list(map(int, patch_size))
+            self.netSeg = build_unet(patch_size=patch_size)
+            state = ckpt.get('state_dict', ckpt)
+            if list(state.keys())[0].startswith('module.'):
+                from torch.nn import DataParallel
+                self.netSeg = DataParallel(self.netSeg)
+            self.netSeg.load_state_dict(state)
+            self.netSeg = self.netSeg.to(self.device)
+            if hasattr(self.netSeg, 'module'):
+                self.netSeg = self.netSeg.module
+            for p in self.netSeg.parameters():
+                p.requires_grad = False
+            self.netSeg.eval()
+            visual_names_A.append('tumor_pred_B')
+            print('Loaded frozen tumor UNet from', opt.unet_checkpoint)
+
         self.visual_names = visual_names_A + visual_names_B
         # specify the models you want to save to the disk. The program will call base_model.save_networks and base_model.load_networks
         if self.isTrain:
@@ -124,6 +151,11 @@ class CycleGANModel(BaseModel):
 
         self.fake_A = self.netG_B(self.real_B)
         self.rec_B = self.netG_A(self.fake_A)
+
+        # Frozen UNet: predict tumor mask on fake_B (for monitoring or future loss)
+        if self.netSeg is not None:
+            with torch.no_grad():
+                self.tumor_pred_B = self.netSeg(self.fake_B)
 
     def backward_D_basic(self, netD, real, fake):
         # Real

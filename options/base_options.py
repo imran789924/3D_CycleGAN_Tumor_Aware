@@ -12,6 +12,8 @@ class BaseOptions():
     def initialize(self, parser):
         parser.add_argument('--data_path', type=str, default='./Data_folder/train/', help='Train images path')
         parser.add_argument('--val_path', type=str, default='./Data_folder/test/', help='Validation images path')
+        parser.add_argument('--mask_dir', type=str, default='', help='Directory containing tumor segmentation masks (e.g. .../Data_folder/train/images_mask). Used when loading pretrained UNet for tumor prediction on fake_B.')
+        parser.add_argument('--unet_checkpoint', type=str, default='', help='Path to pretrained 3D UNet checkpoint for tumor segmentation (frozen). If set, UNet runs on fake_B to predict tumor mask.')
         parser.add_argument('--batch_size', type=int, default=2, help='input batch size')
         parser.add_argument('--patch_size', default=[128, 128, 64], help='Size of the patches extracted from the image')
         parser.add_argument('--input_nc', type=int, default=1, help='# of input image channels')
