@@ -63,6 +63,7 @@ class CycleGANModel(BaseModel):
             parser.add_argument('--use_attention', action='store_true', help='use mask attention in generator (input must have 2 channels: image, mask)')
             parser.add_argument('--attention_strength', type=float, default=1.0, help='strength of mask attention modulation when use_attention is set')
             parser.add_argument('--lambda_tumor', type=float, default=0.0, help='weight for tumor prediction loss (UNet on fake_B vs ground-truth mask). Requires mask_dir and unet_checkpoint.')
+            parser.add_argument('--lambda_bg', type=float, default=0.0, help='weight for background-preserving loss: L1(fake_B, real_A) in background (1-mask). Requires mask_dir. Use to avoid generator saturating background to white.')
 
         return parser
 
@@ -73,6 +74,8 @@ class CycleGANModel(BaseModel):
         self.loss_names = ['D_A', 'G_A', 'cycle_A', 'idt_A', 'D_B', 'G_B', 'cycle_B', 'idt_B']
         if getattr(opt, 'lambda_tumor', 0.0) > 0:
             self.loss_names.append('tumor')
+        if getattr(opt, 'lambda_bg', 0.0) > 0:
+            self.loss_names.append('bg')
         # self.loss_names = ['D_A', 'G_A', 'cycle_A', 'cor_coe_GA', 'D_B', 'G_B', 'cycle_B', 'cor_coe_GB']
         # specify the images you want to save/display. The program will call base_model.get_current_visuals
         visual_names_A = ['real_A', 'fake_B', 'rec_A']
@@ -148,6 +151,16 @@ class CycleGANModel(BaseModel):
             self.optimizers = []
             self.optimizers.append(self.optimizer_G)
             self.optimizers.append(self.optimizer_D)
+            # mixed precision (AMP) for faster training when CUDA is available
+            self.use_amp = getattr(opt, 'use_amp', False) and torch.cuda.is_available()
+            if hasattr(torch, 'amp') and hasattr(torch.amp, 'GradScaler'):
+                self.scaler_G = torch.amp.GradScaler('cuda', enabled=self.use_amp)
+                self.scaler_D = torch.amp.GradScaler('cuda', enabled=self.use_amp)
+            else:
+                self.scaler_G = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+                self.scaler_D = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+            if getattr(opt, 'use_amp', False) and not torch.cuda.is_available():
+                print('Warning: --use_amp ignored (CUDA not available)')
 
     def set_input(self, input):
         AtoB = self.opt.which_direction == 'AtoB'
@@ -174,7 +187,7 @@ class CycleGANModel(BaseModel):
                 with torch.no_grad():
                     self.tumor_pred_B = self.netSeg(self.fake_B)
 
-    def backward_D_basic(self, netD, real, fake):
+    def backward_D_basic(self, netD, real, fake, do_backward=True):
         # Real
         pred_real = netD(real)
         loss_D_real = self.criterionGAN(pred_real, True)
@@ -183,19 +196,33 @@ class CycleGANModel(BaseModel):
         loss_D_fake = self.criterionGAN(pred_fake, False)
         # Combined loss
         loss_D = (loss_D_real + loss_D_fake) * 0.5
-        # backward
-        loss_D.backward()
+        if do_backward:
+            loss_D.backward()
         return loss_D
 
-    def backward_D_A(self):
+    def backward_D_A(self, do_backward=True):
         fake_B = self.fake_B_pool.query(self.fake_B)
-        self.loss_D_A = self.backward_D_basic(self.netD_A, self.real_B, fake_B)
+        if getattr(self, 'use_amp', False):
+            fake_B = fake_B.float()
+        self.loss_D_A = self.backward_D_basic(self.netD_A, self.real_B, fake_B, do_backward=do_backward)
 
-    def backward_D_B(self):
+    def backward_D_B(self, do_backward=True):
         fake_A = self.fake_A_pool.query(self.fake_A)
-        self.loss_D_B = self.backward_D_basic(self.netD_B, self.real_A, fake_A)
+        if getattr(self, 'use_amp', False):
+            fake_A = fake_A.float()
+        self.loss_D_B = self.backward_D_basic(self.netD_B, self.real_A, fake_A, do_backward=do_backward)
 
     def backward_G(self):
+        # When AMP is on, forward ran in autocast so generator outputs are float16; backward_G runs
+        # with autocast disabled (for BCE). Cast to float32 so D and loss ops get matching dtypes.
+        if getattr(self, 'use_amp', False):
+            self.fake_B = self.fake_B.float()
+            self.fake_A = self.fake_A.float()
+            self.rec_A = self.rec_A.float()
+            self.rec_B = self.rec_B.float()
+            if hasattr(self, 'tumor_pred_B') and self.tumor_pred_B is not None:
+                self.tumor_pred_B = self.tumor_pred_B.float()
+
         lambda_idt = self.opt.lambda_identity
         lambda_A = self.opt.lambda_A
         lambda_B = self.opt.lambda_B
@@ -244,24 +271,62 @@ class CycleGANModel(BaseModel):
         else:
             self.loss_tumor = 0.0
 
+        # Background-preserving loss: in background (1 - mask), keep fake_B close to real_A
+        lambda_bg = getattr(self.opt, 'lambda_bg', 0.0)
+        if lambda_bg > 0 and self.mask_B is not None:
+            w = 1.0 - self.mask_B  # background weight
+            diff = torch.abs(self.fake_B - self.real_A)
+            w_sum = w.sum().clamp(min=1e-6)
+            self.loss_bg = (w * diff).sum() / w_sum * lambda_bg
+        else:
+            self.loss_bg = 0.0
+
         # combined loss
         self.loss_G = self.loss_G_A + self.loss_G_B + self.loss_cycle_A + self.loss_cycle_B + self.loss_idt_A + self.loss_idt_B
         if isinstance(self.loss_tumor, torch.Tensor):
             self.loss_G = self.loss_G + self.loss_tumor
+        if isinstance(self.loss_bg, torch.Tensor):
+            self.loss_G = self.loss_G + self.loss_bg
         # self.loss_G = self.loss_G_A + self.loss_G_B + self.loss_cycle_A + self.loss_cycle_B + self.loss_idt_A + self.loss_idt_B + self.loss_cor_coe_GA + self.loss_cor_coe_GB
-        self.loss_G.backward()
+        if not getattr(self, 'use_amp', False):
+            self.loss_G.backward()
 
     def optimize_parameters(self):
-        # forward
-        self.forward()
-        # G_A and G_B
+        use_amp = getattr(self, 'use_amp', False)
+        # Prefer torch.amp (PyTorch 2.1+); fallback to torch.cuda.amp
+        if use_amp and hasattr(torch, 'amp'):
+            _autocast = lambda enabled=True: torch.amp.autocast('cuda', enabled=enabled)
+        else:
+            _autocast = lambda enabled=True: torch.cuda.amp.autocast(enabled=enabled)
+        # forward (autocast for speed; G/D/UNet in mixed precision)
+        if use_amp:
+            with _autocast(enabled=True):
+                self.forward()
+        else:
+            self.forward()
+        # G_A and G_B — backward_G outside autocast (BCE/BCELoss unsafe in autocast)
         self.set_requires_grad([self.netD_A, self.netD_B], False)
         self.optimizer_G.zero_grad()
-        self.backward_G()
-        self.optimizer_G.step()
-        # D_A and D_B
+        if use_amp:
+            with _autocast(enabled=False):
+                self.backward_G()
+            self.scaler_G.scale(self.loss_G).backward()
+            self.scaler_G.step(self.optimizer_G)
+            self.scaler_G.update()
+        else:
+            self.backward_G()
+            self.optimizer_G.step()
+        # D_A and D_B — D backwards outside autocast (BCE unsafe in autocast)
         self.set_requires_grad([self.netD_A, self.netD_B], True)
         self.optimizer_D.zero_grad()
-        self.backward_D_A()
-        self.backward_D_B()
-        self.optimizer_D.step()
+        if use_amp:
+            with _autocast(enabled=False):
+                self.backward_D_A(do_backward=False)
+                self.backward_D_B(do_backward=False)
+            self.scaler_D.scale(self.loss_D_A + self.loss_D_B).backward()
+            self.scaler_D.step(self.optimizer_D)
+            self.scaler_D.update()
+        else:
+            self.backward_D_A()
+            self.backward_D_B()
+            self.optimizer_D.step()

@@ -438,8 +438,8 @@ class NifitDataSet(torch.utils.data.Dataset):
         self.mask_dir = mask_dir
         if mask_dir and os.path.isdir(mask_dir):
             self.masks_list = lstFiles(mask_dir)
-            assert len(self.masks_list) == len(self.labels_list), \
-                'mask_dir must have same number of files as labels (got %d vs %d)' % (len(self.masks_list), len(self.labels_list))
+            assert len(self.masks_list) == len(self.images_list), \
+                'mask_dir must have same number of files as images (mask is for domain A; got %d vs %d)' % (len(self.masks_list), len(self.images_list))
         else:
             self.masks_list = []
 
@@ -512,16 +512,19 @@ class NifitDataSet(torch.utils.data.Dataset):
             label.SetOrigin(image.GetOrigin())
             label.SetSpacing(image.GetSpacing())
 
-        # Optional: load tumor mask (same index as label; same augmentation applied in transforms)
+        # Optional: load tumor mask for domain A (same index as image); resample onto image grid so size/geometry match
         if self.masks_list:
-            mask_path = self.masks_list[label_index]
+            mask_path = self.masks_list[index]
             mask_sitk = self.read_image(mask_path)
             mask_np = sitk.GetArrayFromImage(mask_sitk)
             mask_np = (mask_np > 0).astype(np.float32)
             mask_sitk = sitk.GetImageFromArray(mask_np)
-            mask_sitk.SetDirection(label.GetDirection())
-            mask_sitk.SetOrigin(label.GetOrigin())
-            mask_sitk.SetSpacing(label.GetSpacing())
+            mask_sitk.SetDirection(image.GetDirection())
+            mask_sitk.SetOrigin(image.GetOrigin())
+            mask_sitk.SetSpacing(image.GetSpacing())
+            # Resample mask onto image grid so same size/geometry (mask file may have different dimensions)
+            identity = sitk.Transform(3, sitk.sitkIdentity)
+            mask_sitk = sitk.Resample(mask_sitk, image, identity, sitk.sitkNearestNeighbor, 0.0)
             sample = {'image': image, 'label': label, 'mask': mask_sitk}
         else:
             sample = {'image': image, 'label': label}
@@ -1065,8 +1068,9 @@ class CropBackground(object):
 
 class RandomCrop(object):
     """
-    Random crop that is always valid for BOTH image and label even if sizes differ.
-    Tries to enforce min_pixel on label (domain B here), but will fall back safely.
+    Random crop with consistent (x, y) for image, label, and mask so real_A and real_B
+    show the same (x, y) region. Z can differ for label (not guaranteed to match across domains).
+    Mask always uses the same 3D crop as image (real_A) so mask_B stays aligned with real_A.
     """
 
     def __init__(self, output_size, drop_ratio=0.1, min_pixel=1, max_tries=50):
@@ -1089,24 +1093,26 @@ class RandomCrop(object):
         image, label = sample['image'], sample['label']
         mask_vol = sample.get('mask')
         crop = list(self.output_size)
-
         size_img = list(image.GetSize())
         size_lbl = list(label.GetSize())
         if mask_vol is not None:
             size_mask = list(mask_vol.GetSize())
-            crop = [min(crop[d], size_img[d], size_lbl[d], size_mask[d]) for d in range(3)]
         else:
-            crop = [min(crop[d], size_img[d], size_lbl[d]) for d in range(3)]
+            size_mask = size_img  # no mask: use image for bounds
 
-        # if anything became 0, just return as-is (shouldn't happen if Padding before)
+        # Crop size: limit by each volume per axis
+        crop[0] = min(crop[0], size_img[0], size_lbl[0], size_mask[0])
+        crop[1] = min(crop[1], size_img[1], size_lbl[1], size_mask[1])
+        crop[2] = min(crop[2], size_img[2], size_lbl[2], size_mask[2])
         if min(crop) <= 0:
             return sample
 
-        # allowed start ranges that are valid for BOTH (and mask if present)
-        max_start = [min(size_img[d] - crop[d], size_lbl[d] - crop[d]) for d in range(3)]
-        if mask_vol is not None:
-            max_start = [min(max_start[d], size_mask[d] - crop[d]) for d in range(3)]
-        max_start = [max(0, m) for m in max_start]
+        # Same (x, y) for all: valid range for image, label, and mask
+        max_start_x = max(0, min(size_img[0] - crop[0], size_lbl[0] - crop[0], size_mask[0] - crop[0]))
+        max_start_y = max(0, min(size_img[1] - crop[1], size_lbl[1] - crop[1], size_mask[1] - crop[1]))
+        # Z: independent for image/mask vs label (z not guaranteed to match across domains)
+        max_start_z_img = max(0, size_img[2] - crop[2])
+        max_start_z_lbl = max(0, size_lbl[2] - crop[2])
 
         thr = sitk.BinaryThresholdImageFilter()
         thr.SetLowerThreshold(1)
@@ -1121,18 +1127,19 @@ class RandomCrop(object):
             return o
 
         for _ in range(self.max_tries):
-            start = [
-                0 if max_start[0] == 0 else np.random.randint(0, max_start[0] + 1),
-                0 if max_start[1] == 0 else np.random.randint(0, max_start[1] + 1),
-                0 if max_start[2] == 0 else np.random.randint(0, max_start[2] + 1),
-            ]
+            x_start = np.random.randint(0, max_start_x + 1) if max_start_x > 0 else 0
+            y_start = np.random.randint(0, max_start_y + 1) if max_start_y > 0 else 0
+            z_start_img = np.random.randint(0, max_start_z_img + 1) if max_start_z_img > 0 else 0
+            z_start_lbl = np.random.randint(0, max_start_z_lbl + 1) if max_start_z_lbl > 0 else 0
 
-            # crop label safely first
-            label_crop = _safe_roi(label, start, crop)
+            start_img = [x_start, y_start, z_start_img]  # same (x,y) for image and mask; z for image
+            start_lbl = [x_start, y_start, z_start_lbl]  # same (x,y) for label; z can differ
+
+            label_crop = _safe_roi(label, start_lbl, crop)
 
             if Segmentation is False:
                 mask = thr.Execute(label)
-                mask_crop = _safe_roi(mask, start, crop)
+                mask_crop = _safe_roi(mask, start_lbl, crop)
                 stat = sitk.StatisticsImageFilter()
                 stat.Execute(mask_crop)
                 s = stat.GetSum()
@@ -1143,27 +1150,26 @@ class RandomCrop(object):
 
             if s < self.min_pixel:
                 if self.drop(self.drop_ratio):
-                    image_crop = _safe_roi(image, start, crop)
-                    mask_crop = _safe_roi(mask_vol, start, crop) if mask_vol is not None else None
+                    image_crop = _safe_roi(image, start_img, crop)
+                    mask_crop = _safe_roi(mask_vol, start_img, crop) if mask_vol is not None else None
                     return make_out(image_crop, label_crop, mask_crop)
                 else:
                     continue
             else:
-                image_crop = _safe_roi(image, start, crop)
-                mask_crop = _safe_roi(mask_vol, start, crop) if mask_vol is not None else None
+                image_crop = _safe_roi(image, start_img, crop)
+                mask_crop = _safe_roi(mask_vol, start_img, crop) if mask_vol is not None else None
                 return make_out(image_crop, label_crop, mask_crop)
 
-        # fallback: center crop (always valid)
-        center_start = [
-            max(0, (min(size_img[0], size_lbl[0]) - crop[0]) // 2),
-            max(0, (min(size_img[1], size_lbl[1]) - crop[1]) // 2),
-            max(0, (min(size_img[2], size_lbl[2]) - crop[2]) // 2),
-        ]
-        if mask_vol is not None:
-            center_start = [min(center_start[d], max(0, size_mask[d] - crop[d])) for d in range(3)]
-        image_crop = _safe_roi(image, center_start, crop)
-        label_crop = _safe_roi(label, center_start, crop)
-        mask_crop = _safe_roi(mask_vol, center_start, crop) if mask_vol is not None else None
+        # fallback: center crop with same (x,y), independent z
+        center_x = max(0, (min(size_img[0], size_lbl[0], size_mask[0]) - crop[0]) // 2)
+        center_y = max(0, (min(size_img[1], size_lbl[1], size_mask[1]) - crop[1]) // 2)
+        center_z_img = max(0, (size_img[2] - crop[2]) // 2)
+        center_z_lbl = max(0, (size_lbl[2] - crop[2]) // 2)
+        start_img = [center_x, center_y, center_z_img]
+        start_lbl = [center_x, center_y, center_z_lbl]
+        image_crop = _safe_roi(image, start_img, crop)
+        label_crop = _safe_roi(label, start_lbl, crop)
+        mask_crop = _safe_roi(mask_vol, start_img, crop) if mask_vol is not None else None
         return make_out(image_crop, label_crop, mask_crop)
 
 
@@ -1253,6 +1259,7 @@ class Augmentation(object):
             image = sitk.Resample(image, bspline)
             label = sitk.Resample(label, bspline)
             if mask is not None:
+                # Mask is for domain A: resample onto image's grid so mask stays aligned with real_A
                 mask = sitk.Resample(mask, image, bspline, sitk.sitkNearestNeighbor, 0.0)
             return self._out(image, label, mask)
 

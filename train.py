@@ -46,7 +46,16 @@ if __name__ == '__main__':
     mask_dir = getattr(opt, 'mask_dir', '') or ''
     train_set = NifitDataSet(opt.data_path, which_direction='AtoB', transforms=trainTransforms, shuffle_labels=True, train=True, mask_dir=mask_dir)
     print('lenght train list:', len(train_set))
-    train_loader = DataLoader(train_set, batch_size=opt.batch_size, shuffle=True, num_workers=opt.workers, pin_memory=True, collate_fn=collate_optional_mask)  # collate handles (img, label) or (img, label, mask)
+    train_loader = DataLoader(
+        train_set,
+        batch_size=opt.batch_size,
+        shuffle=True,
+        num_workers=opt.workers,
+        pin_memory=True,
+        collate_fn=collate_optional_mask,
+        persistent_workers=opt.workers > 0,
+        prefetch_factor=4 if opt.workers > 0 else None,
+    )
 
     # -----------------------------------------------------
     model = create_model(opt)  # creation of the model
@@ -83,12 +92,14 @@ if __name__ == '__main__':
 
             iter_data_time = time.time()
 
-        # Save middle slices of real_A, fake_B, real_B, fake_A, etc. as PNG for visibility
-        try:
-            visuals = model.get_current_visuals()
-            save_epoch_slices(visuals, model.save_dir, epoch)
-        except Exception as e:
-            print('Warning: could not save epoch slices: %s' % e)
+        # Save middle slices every save_slices_freq to reduce I/O (default: every 10 epochs; set 1 for every epoch)
+        save_slices_freq = getattr(opt, 'save_slices_freq', 10)
+        if epoch % save_slices_freq == 0 or epoch == 1:
+            try:
+                visuals = model.get_current_visuals()
+                save_epoch_slices(visuals, model.save_dir, epoch)
+            except Exception as e:
+                print('Warning: could not save epoch slices: %s' % e)
 
         if epoch % opt.save_epoch_freq == 0:
             print('saving the model at the end of epoch %d, iters %d' %

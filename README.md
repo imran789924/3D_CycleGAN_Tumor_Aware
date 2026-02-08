@@ -1,7 +1,6 @@
 python train.py \
-  --name test_my_cyclegan_tumor_segLoss_noIdt \
+  --name test_my_cyclegan_tumor_segLoss_noIdt_upd_3 \
   --data_path ./Data_folder/train \
-  --mask_dir ./Data_folder/train/images_mask \
   --unet_checkpoint ./unet_tumor_segmentation/checkpoints/epoch_20.pth \
   --lambda_tumor 0.5 \
   --batch_size 1 \
@@ -9,9 +8,13 @@ python train.py \
   --niter_decay 200 \
   --gpu_ids 0 \
   --use_attention --attention_strength 1.0 \
-  --lambda_tumor 50 \
+  --lambda_tumor 20 \
   --mask_dir Data_folder/train/images_mask \
-  --ngf 32 --ndf 32 --lambda_identity 0 
+  --ngf 32 --ndf 32 --lambda_identity 0 \
+  --lambda_bg 2.0 \
+  --use_amp \
+  --workers 8 \
+  --save_slices_freq 1
 
 
 

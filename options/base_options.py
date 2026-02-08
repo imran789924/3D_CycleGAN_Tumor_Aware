@@ -36,6 +36,7 @@ class BaseOptions():
         parser.add_argument('--which_direction', type=str, default='AtoB', help='AtoB or BtoA (keep it AtoB)')
         parser.add_argument('--checkpoints_dir', type=str, default='./checkpoints', help='models are saved here')
         parser.add_argument('--workers', default=8, type=int, help='number of data loading workers')
+        parser.add_argument('--use_amp', action='store_true', help='use automatic mixed precision (faster, less GPU memory)')
         parser.add_argument('--norm', type=str, default='instance', help='instance normalization or batch normalization')
 
         parser.add_argument('--no_dropout', action='store_true', help='no dropout for the generator')
