@@ -38,10 +38,11 @@ python unet_tumor_segmentation/train.py \
 python unet_tumor_segmentation/train.py \
   --data_path ./Data_folder/train/ \
   --mask_dir ./Data_folder/train/images_mask \
-  --patch_size 128 128 64 \
+  --patch_size 192 192 64 \
   --checkpoint_dir ./unet_tumor_segmentation/checkpoints \
   --epochs 100 \
   --batch_size 2 \
+  --pos_weight 10 \
   --gpu_ids 0
 ```
 

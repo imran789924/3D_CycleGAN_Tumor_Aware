@@ -1,8 +1,7 @@
 python train.py \
-  --name test_my_cyclegan_tumor_segLoss_noIdt_upd_3 \
+  --name test_my_cyclegan_tumor_segLoss_noIdt_upd_6 \
   --data_path ./Data_folder/train \
-  --unet_checkpoint ./unet_tumor_segmentation/checkpoints/epoch_20.pth \
-  --lambda_tumor 0.5 \
+  --unet_checkpoint ./unet_tumor_segmentation/checkpoints/epoch_10.pth \
   --batch_size 1 \
   --niter 200 \
   --niter_decay 200 \

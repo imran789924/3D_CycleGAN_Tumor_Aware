@@ -267,7 +267,8 @@ class CycleGANModel(BaseModel):
         # Tumor prediction loss (frozen UNet on fake_B vs ground-truth mask)
         lambda_tumor = getattr(self.opt, 'lambda_tumor', 0.0)
         if lambda_tumor > 0 and self.netSeg is not None and self.mask_B is not None:
-            self.loss_tumor = torch.nn.functional.binary_cross_entropy(self.tumor_pred_B, self.mask_B) * lambda_tumor
+            pred = self.tumor_pred_B.clamp(1e-7, 1.0 - 1e-7)  # avoid log(0) in BCE
+            self.loss_tumor = torch.nn.functional.binary_cross_entropy(pred, self.mask_B) * lambda_tumor
         else:
             self.loss_tumor = 0.0
 

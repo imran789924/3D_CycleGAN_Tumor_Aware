@@ -50,7 +50,8 @@ def main():
     if len(gpu_ids) > 0 and torch.cuda.is_available():
         model = nn.DataParallel(model, gpu_ids)
     model = model.to(device)
-    criterion = nn.BCELoss()
+    criterion = nn.BCELoss(reduction='none')
+    pos_weight = getattr(args, 'pos_weight', None)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     start_epoch = 0
@@ -71,7 +72,12 @@ def main():
             img, mask = img.to(device), mask.to(device)
             optimizer.zero_grad()
             pred = model(img)
-            loss = criterion(pred, mask)
+            el = criterion(pred, mask)
+            if pos_weight is not None and pos_weight > 1.0:
+                w = torch.where(mask > 0.5, el.new_tensor(pos_weight), el.new_tensor(1.0))
+                loss = (w * el).mean()
+            else:
+                loss = el.mean()
             loss.backward()
             optimizer.step()
             running_loss += loss.item()

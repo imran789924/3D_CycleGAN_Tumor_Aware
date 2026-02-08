@@ -28,6 +28,8 @@ def parse_args():
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--batch_size', type=int, default=2)
     parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--pos_weight', type=float, default=None,
+                        help='BCE weight for positive (tumor) voxels; e.g. 10 for imbalanced data. Default: 1 (no weighting)')
     parser.add_argument('--workers', type=int, default=4)
     parser.add_argument('--save_freq', type=int, default=5, help='Save checkpoint every N epochs')
     # Checkpoints and output
