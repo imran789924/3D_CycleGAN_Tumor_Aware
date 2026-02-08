@@ -40,6 +40,7 @@ def main():
         min_pixel=args.min_pixel,
         drop_ratio=args.drop_ratio,
         train=True,
+        images_subdir=getattr(args, 'images_subdir', 'labels'),
     )
     if len(train_set) == 0:
         print('No training samples. Check data_path and mask_dir.')

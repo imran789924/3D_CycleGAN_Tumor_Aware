@@ -20,11 +20,11 @@ _interpolator_image = 'linear'
 
 class TumorSegDataset(torch.utils.data.Dataset):
     """
-    Loads 3D image + binary tumor mask. Images from data_path/images,
+    Loads 3D image + binary tumor mask. Input volumes from data_path/images_subdir,
     masks from mask_dir. Paired by index (same count and order after sorting).
     """
     def __init__(self, data_path, mask_dir, patch_size, new_resolution=(0.45, 0.45, 0.45),
-                 resample=False, min_pixel=0.1, drop_ratio=0., train=True):
+                 resample=False, min_pixel=0.1, drop_ratio=0., train=True, images_subdir='labels'):
         self.data_path = data_path
         self.mask_dir = mask_dir
         self.patch_size = tuple(patch_size) if not isinstance(patch_size, tuple) else patch_size
@@ -33,9 +33,10 @@ class TumorSegDataset(torch.utils.data.Dataset):
         self.min_pixel = min_pixel
         self.drop_ratio = drop_ratio
         self.train = train
+        self.images_subdir = images_subdir
         self.bit = sitk.sitkFloat32
 
-        images_dir = os.path.join(data_path, 'images')
+        images_dir = os.path.join(data_path, images_subdir)
         self.images_list = lstFiles(images_dir)
         if mask_dir and os.path.isdir(mask_dir):
             self.masks_list = lstFiles(mask_dir)

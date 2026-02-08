@@ -26,14 +26,17 @@ python test.py \
   --gpu_ids 0
 
 
-for i in 0 1 2; do
+# Run on samples 0001 to 0112 (4-digit names; change range as needed: {START..END})
+for i in {1..112}; do
+  idx=$(printf '%04d' $i)
   python test.py \
-    --name my_cyclegan \
-    --image ./Data_folder/test/images/${i}.nii.gz \
-    --result ./Data_folder/test/images/result_${i}.nii.gz \
+    --name 1_my_cyclegan_tumor_segLoss_noIdt \
+    --image ./Data_folder/train/images/${idx}.nii \
+    --result ./Data_folder/test/results/result_${idx}.nii \
     --stride_inplane 32 \
     --stride_layer 32 \
-    --gpu_ids 0
+    --gpu_ids 0 \
+    --ndf 32 --ngf 32
 done
 
 

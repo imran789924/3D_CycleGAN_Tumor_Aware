@@ -188,7 +188,10 @@ def inference(model, image_path, result_path, resample, resolution, patch_size_x
     label = from_numpy_to_itk(label_np, image_pre_pad)
     # ---------------------------------------------------------------------------------------------
 
-    # save label
+    # save label (ensure output directory exists)
+    out_dir = os.path.dirname(result_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     writer = sitk.ImageFileWriter()
 
     if resample is True:

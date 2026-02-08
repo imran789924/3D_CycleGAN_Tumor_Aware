@@ -9,9 +9,11 @@ def parse_args():
     parser = argparse.ArgumentParser(description='3D UNet tumor segmentation (pretrain for CycleGAN)')
     # Data
     parser.add_argument('--data_path', type=str, default='../Data_folder/train/',
-                        help='Base path containing images/ subfolder')
+                        help='Base path containing subfolder with input volumes (see --images_subdir)')
+    parser.add_argument('--images_subdir', type=str, default='labels',
+                        help='Subfolder under data_path for input volumes to segment (e.g. labels or images). Masks from mask_dir.')
     parser.add_argument('--mask_dir', type=str, default='',
-                        help='Directory containing tumor masks (e.g. .../Data_folder/train/images_mask). Same number/order of files as data_path/images.')
+                        help='Directory containing tumor masks. Same number/order of files as data_path/images_subdir.')
     parser.add_argument('--val_data_path', type=str, default='../Data_folder/test/',
                         help='Validation base path (images/ subfolder)')
     parser.add_argument('--val_mask_dir', type=str, default='',
