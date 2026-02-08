@@ -291,7 +291,8 @@ def flipit(image, axes):
     img.SetOrigin(origin)
     img.SetSpacing(spacing)
 
-    return image
+    return img   # <-- FIX: return the flipped image
+
 
 
 def brightness(image):
@@ -384,6 +385,36 @@ def imadjust(image,gamma=np.random.uniform(1, 2)):
     img.SetSpacing(spacing)
 
     return img
+
+
+def _safe_roi(img, start, size):
+    """
+    Safe ROI cropping: clamps start so that (start + size) stays inside img size.
+    Returns cropped image. If img smaller than requested size in any axis,
+    it will crop the maximum possible region from 0.
+    """
+    img_size = list(img.GetSize())
+    start = list(start)
+    size = list(size)
+
+    # clamp size to image size
+    for d in range(3):
+        size[d] = int(min(size[d], img_size[d]))
+
+    # clamp start
+    for d in range(3):
+        max_start = img_size[d] - size[d]
+        if max_start < 0:
+            start[d] = 0
+        else:
+            start[d] = int(max(0, min(start[d], max_start)))
+
+    roi = sitk.RegionOfInterestImageFilter()
+    roi.SetIndex([int(start[0]), int(start[1]), int(start[2])])
+    roi.SetSize([int(size[0]), int(size[1]), int(size[2])])
+    return roi.Execute(img)
+
+
 
 # --------------------------------------------------------------------------------------
 
@@ -875,61 +906,45 @@ class Resample(object):
 
 class Padding(object):
     """
-    Add padding to the image if size is smaller than patch size
-
-      Args:
-          output_size (tuple or int): Desired output size. If int, a cubic volume is formed
-      """
+    Pad image and label independently so each reaches at least output_size.
+    Works even if image and label sizes differ (common in unpaired CycleGAN).
+    """
 
     def __init__(self, output_size):
         self.name = 'Padding'
-
         assert isinstance(output_size, (int, tuple))
         if isinstance(output_size, int):
             self.output_size = (output_size, output_size, output_size)
         else:
             assert len(output_size) == 3
-            self.output_size = output_size
+            self.output_size = tuple(output_size)
 
-        assert all(i > 0 for i in list(self.output_size))
+    def _pad_to_size(self, img, target_size):
+        old = list(img.GetSize())
+        target = [max(old[d], target_size[d]) for d in range(3)]
+        if old == target:
+            return img
+
+        # pad at end by resampling to larger size with same spacing/origin/direction
+        resampler = sitk.ResampleImageFilter()
+        resampler.SetOutputSpacing(img.GetSpacing())
+        resampler.SetOutputOrigin(img.GetOrigin())
+        resampler.SetOutputDirection(img.GetDirection())
+        resampler.SetSize([int(target[0]), int(target[1]), int(target[2])])
+
+        # identity transform, default pixel value 0
+        resampler.SetTransform(sitk.Transform())
+        resampler.SetInterpolator(sitk.sitkNearestNeighbor)  # safer padding for both
+        resampler.SetDefaultPixelValue(0)
+
+        return resampler.Execute(img)
 
     def __call__(self, sample):
         image, label = sample['image'], sample['label']
-        size_old = image.GetSize()
+        image = self._pad_to_size(image, self.output_size)
+        label = self._pad_to_size(label, self.output_size)
+        return {'image': image, 'label': label}
 
-        if (size_old[0] >= self.output_size[0]) and (size_old[1] >= self.output_size[1]) and (
-                size_old[2] >= self.output_size[2]):
-            return sample
-        else:
-            output_size = self.output_size
-            output_size = list(output_size)
-            if size_old[0] > self.output_size[0]:
-                output_size[0] = size_old[0]
-            if size_old[1] > self.output_size[1]:
-                output_size[1] = size_old[1]
-            if size_old[2] > self.output_size[2]:
-                output_size[2] = size_old[2]
-
-            output_size = tuple(output_size)
-
-            resampler = sitk.ResampleImageFilter()
-            resampler.SetOutputSpacing(image.GetSpacing())
-            resampler.SetSize(output_size)
-
-            # resample on image
-            resampler.SetInterpolator(sitk.sitkBSpline)
-            resampler.SetOutputOrigin(image.GetOrigin())
-            resampler.SetOutputDirection(image.GetDirection())
-            image = resampler.Execute(image)
-
-            # resample on label
-            resampler.SetInterpolator(sitk.sitkBSpline)
-            resampler.SetOutputOrigin(label.GetOrigin())
-            resampler.SetOutputDirection(label.GetDirection())
-
-            label = resampler.Execute(label)
-
-            return {'image': image, 'label': label}
 
 
 class Adapt_eq_histogram(object):
@@ -960,13 +975,12 @@ class Adapt_eq_histogram(object):
 
 class CropBackground(object):
     """
-    Crop the background of the images. Center is fixed in the centroid of the skull
-    It crops the images in the xy plane, no cropping is applied to the z direction
+    Safe crop around image foreground in XY, keeps Z from 0..min(z, desired_z).
+    Never requests ROI outside image.
     """
 
     def __init__(self, output_size):
         self.name = 'CropBackground'
-
         assert isinstance(output_size, (int, tuple))
         if isinstance(output_size, int):
             self.output_size = (output_size, output_size, output_size)
@@ -974,139 +988,134 @@ class CropBackground(object):
             assert len(output_size) == 3
             self.output_size = output_size
 
-        assert all(i > 0 for i in list(self.output_size))
-
     def __call__(self, sample):
         image, label = sample['image'], sample['label']
-        size_new = self.output_size
+        size_new = list(self.output_size)
 
-        threshold = sitk.BinaryThresholdImageFilter()
-        threshold.SetLowerThreshold(1)
-        threshold.SetUpperThreshold(255)
-        threshold.SetInsideValue(1)
-        threshold.SetOutsideValue(0)
+        thr = sitk.BinaryThresholdImageFilter()
+        thr.SetLowerThreshold(1)
+        thr.SetUpperThreshold(255)
+        thr.SetInsideValue(1)
+        thr.SetOutsideValue(0)
 
-        roiFilter = sitk.RegionOfInterestImageFilter()
-        roiFilter.SetSize([size_new[0], size_new[1], size_new[2]])
+        mask = thr.Execute(image)
+        mask_np = sitk.GetArrayFromImage(mask)  # (z,y,x)
+        # project to find centroid in XY robustly
+        proj = mask_np.sum(axis=0)  # (y,x)
 
-        # label_mask = threshold.Execute(label)
-        # label_mask = sitk.GetArrayFromImage(label_mask)
-        # label_mask = np.transpose(label_mask, (2, 1, 0))
+        if proj.sum() == 0:
+            # no foreground -> center crop
+            x_centroid = image.GetSize()[0] // 2
+            y_centroid = image.GetSize()[1] // 2
+        else:
+            ys, xs = np.where(proj > 0)
+            y_centroid = int(np.mean(ys))
+            x_centroid = int(np.mean(xs))
 
-        image_mask = threshold.Execute(image)
-        image_mask = sitk.GetArrayFromImage(image_mask)
-        image_mask = np.transpose(image_mask, (2, 1, 0))
+        # convert centroid in (x,y) index space
+        # desired crop start
+        start_x = int(x_centroid - size_new[0] / 2)
+        start_y = int(y_centroid - size_new[1] / 2)
 
-        centroid = scipy.ndimage.measurements.center_of_mass(image_mask)
+        # keep z from 0
+        start = [start_x, start_y, 0]
 
-        x_centroid = np.int(centroid[0])
-        y_centroid = np.int(centroid[1])
+        # crop image & label safely (independently)
+        img_crop = _safe_roi(image, start, size_new)
+        lbl_crop = _safe_roi(label, start, size_new)
 
-        roiFilter.SetIndex([int(x_centroid-(size_new[0])/2), int(y_centroid-(size_new[1])/2), 0])
+        return {'image': img_crop, 'label': lbl_crop}
 
-        label_crop = roiFilter.Execute(label)
-        image_crop = roiFilter.Execute(image)
-
-        return {'image': image_crop, 'label': label_crop}
 
 
 class RandomCrop(object):
     """
-    Crop randomly the image in a sample. This is usually used for data augmentation.
-      Drop ratio is implemented for randomly dropout crops with empty label. (Default to be 0.2)
-      This transformation only applicable in train mode
-
-    Args:
-      output_size (tuple or int): Desired output size. If int, cubic crop is made.
+    Random crop that is always valid for BOTH image and label even if sizes differ.
+    Tries to enforce min_pixel on label (domain B here), but will fall back safely.
     """
 
-    def __init__(self, output_size, drop_ratio=0.1, min_pixel=1):
+    def __init__(self, output_size, drop_ratio=0.1, min_pixel=1, max_tries=50):
         self.name = 'Random Crop'
-
         assert isinstance(output_size, (int, tuple))
         if isinstance(output_size, int):
             self.output_size = (output_size, output_size, output_size)
         else:
             assert len(output_size) == 3
-            self.output_size = output_size
+            self.output_size = tuple(output_size)
 
-        assert isinstance(drop_ratio, (int, float))
-        if drop_ratio >= 0 and drop_ratio <= 1:
-            self.drop_ratio = drop_ratio
-        else:
-            raise RuntimeError('Drop ratio should be between 0 and 1')
-
-        assert isinstance(min_pixel, int)
-        if min_pixel >= 0:
-            self.min_pixel = min_pixel
-        else:
-            raise RuntimeError('Min label pixel count should be integer larger than 0')
-
-    def __call__(self, sample):
-        image, label = sample['image'], sample['label']
-        size_old = image.GetSize()
-        size_new = self.output_size
-
-        contain_label = False
-
-        roiFilter = sitk.RegionOfInterestImageFilter()
-        roiFilter.SetSize([size_new[0], size_new[1], size_new[2]])
-
-        # statFilter = sitk.StatisticsImageFilter()     # not useful
-        # statFilter.Execute(label)
-        # print(statFilter.GetMaximum(), statFilter.GetSum())
-
-        while not contain_label:
-            # get the start crop coordinate in ijk
-            if size_old[0] <= size_new[0]:
-                start_i = 0
-            else:
-                start_i = np.random.randint(0, size_old[0] - size_new[0])
-
-            if size_old[1] <= size_new[1]:
-                start_j = 0
-            else:
-                start_j = np.random.randint(0, size_old[1] - size_new[1])
-
-            if size_old[2] <= size_new[2]:
-                start_k = 0
-            else:
-                start_k = np.random.randint(0, size_old[2] - size_new[2])
-
-            roiFilter.SetIndex([start_i, start_j, start_k])
-
-            if Segmentation is False:
-                # threshold label into only ones and zero
-                threshold = sitk.BinaryThresholdImageFilter()
-                threshold.SetLowerThreshold(1)
-                threshold.SetUpperThreshold(255)
-                threshold.SetInsideValue(1)
-                threshold.SetOutsideValue(0)
-                mask = threshold.Execute(label)
-                mask_cropped = roiFilter.Execute(mask)
-                label_crop = roiFilter.Execute(label)
-                statFilter = sitk.StatisticsImageFilter()
-                statFilter.Execute(mask_cropped)  # mine for GANs
-
-            if Segmentation is True:
-                label_crop = roiFilter.Execute(label)
-                statFilter = sitk.StatisticsImageFilter()
-                statFilter.Execute(label_crop)
-
-            # will iterate until a sub volume containing label is extracted
-            # pixel_count = seg_crop.GetHeight()*seg_crop.GetWidth()*seg_crop.GetDepth()
-            # if statFilter.GetSum()/pixel_count<self.min_ratio:
-            if statFilter.GetSum() < self.min_pixel:
-                contain_label = self.drop(self.drop_ratio)  # has some probabilty to contain patch with empty label
-            else:
-                contain_label = True
-
-        image_crop = roiFilter.Execute(image)
-
-        return {'image': image_crop, 'label': label_crop}
+        self.drop_ratio = float(drop_ratio)
+        self.min_pixel = int(min_pixel)
+        self.max_tries = int(max_tries)
 
     def drop(self, probability):
         return random.random() <= probability
+
+    def __call__(self, sample):
+        image, label = sample['image'], sample['label']
+        crop = list(self.output_size)
+
+        size_img = list(image.GetSize())
+        size_lbl = list(label.GetSize())
+
+        # crop size cannot exceed either image or label size
+        crop = [min(crop[d], size_img[d], size_lbl[d]) for d in range(3)]
+
+        # if anything became 0, just return as-is (shouldn't happen if Padding before)
+        if min(crop) <= 0:
+            return sample
+
+        # allowed start ranges that are valid for BOTH
+        max_start = [min(size_img[d] - crop[d], size_lbl[d] - crop[d]) for d in range(3)]
+        max_start = [max(0, m) for m in max_start]
+
+        thr = sitk.BinaryThresholdImageFilter()
+        thr.SetLowerThreshold(1)
+        thr.SetUpperThreshold(255)
+        thr.SetInsideValue(1)
+        thr.SetOutsideValue(0)
+
+        for _ in range(self.max_tries):
+            start = [
+                0 if max_start[0] == 0 else np.random.randint(0, max_start[0] + 1),
+                0 if max_start[1] == 0 else np.random.randint(0, max_start[1] + 1),
+                0 if max_start[2] == 0 else np.random.randint(0, max_start[2] + 1),
+            ]
+
+            # crop label safely first
+            label_crop = _safe_roi(label, start, crop)
+
+            if Segmentation is False:
+                mask = thr.Execute(label)
+                mask_crop = _safe_roi(mask, start, crop)
+                stat = sitk.StatisticsImageFilter()
+                stat.Execute(mask_crop)
+                s = stat.GetSum()
+            else:
+                stat = sitk.StatisticsImageFilter()
+                stat.Execute(label_crop)
+                s = stat.GetSum()
+
+            if s < self.min_pixel:
+                if self.drop(self.drop_ratio):
+                    # accept empty crop with some probability
+                    image_crop = _safe_roi(image, start, crop)
+                    return {'image': image_crop, 'label': label_crop}
+                else:
+                    continue
+            else:
+                image_crop = _safe_roi(image, start, crop)
+                return {'image': image_crop, 'label': label_crop}
+
+        # fallback: center crop (always valid)
+        center_start = [
+            max(0, (min(size_img[0], size_lbl[0]) - crop[0]) // 2),
+            max(0, (min(size_img[1], size_lbl[1]) - crop[1]) // 2),
+            max(0, (min(size_img[2], size_lbl[2]) - crop[2]) // 2),
+        ]
+        image_crop = _safe_roi(image, center_start, crop)
+        label_crop = _safe_roi(label, center_start, crop)
+        return {'image': image_crop, 'label': label_crop}
+
 
 
 class Augmentation(object):
