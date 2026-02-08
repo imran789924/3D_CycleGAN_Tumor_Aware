@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn import init
 import functools
 from torch.optim import lr_scheduler
@@ -72,14 +73,14 @@ def init_net(net, init_type='normal', init_gain=0.02, gpu_ids=[]):
     return net
 
 
-def define_G(input_nc, output_nc, ngf, netG, norm='batch', use_dropout=False, init_type='normal', init_gain=0.02, gpu_ids=[]):
+def define_G(input_nc, output_nc, ngf, netG, norm='batch', use_dropout=False, init_type='normal', init_gain=0.02, gpu_ids=[], use_attention=False, attention_strength=1.0):
     net = None
     norm_layer = get_norm_layer(norm_type=norm)
 
     if netG == 'resnet_9blocks':
-        net = ResnetGenerator(input_nc, output_nc, ngf, norm_layer=norm_layer, use_dropout=use_dropout, n_blocks=9)
+        net = ResnetGenerator(input_nc, output_nc, ngf, norm_layer=norm_layer, use_dropout=use_dropout, n_blocks=9, use_attention=use_attention, attention_strength=attention_strength)
     elif netG == 'resnet_6blocks':
-        net = ResnetGenerator(input_nc, output_nc, ngf, norm_layer=norm_layer, use_dropout=use_dropout, n_blocks=6)
+        net = ResnetGenerator(input_nc, output_nc, ngf, norm_layer=norm_layer, use_dropout=use_dropout, n_blocks=6, use_attention=use_attention, attention_strength=attention_strength)
     elif netG == 'unet_custom':
         net = UnetGenerator(input_nc, output_nc, 5, ngf, norm_layer=norm_layer, use_dropout=use_dropout)
     elif netG == 'unet_128':
@@ -140,6 +141,33 @@ class GANLoss(nn.Module):
         return self.loss(input, target_tensor)
 
 
+##############################################################################
+# Mask attention (3D): modulate features by mask; turn on/off with use_attention
+##############################################################################
+class MaskAttention3D(nn.Module):
+    """
+    Spatial attention in 3D: mask (N, 1, D, H, W) modulates features (N, C, D, H, W).
+    Mask is expected in range [-1, 1]; normalized to [0, 1] then applied as
+    features + (features * mask_normalized * strength).
+    """
+    def __init__(self, strength=1.0):
+        super().__init__()
+        self.strength = strength
+
+    def forward(self, features, mask):
+        # features: (N, C, D, H, W)
+        # mask:     (N, 1, D, H, W) in range [-1, 1]
+        mask = F.interpolate(
+            mask,
+            size=features.shape[2:],
+            mode='trilinear',
+            align_corners=False,
+        )
+        mask_normalized = (mask + 1.0) / 2.0
+        mask_normalized = mask_normalized.clamp(0, 1)
+        return features + (features * mask_normalized * self.strength)
+
+
 '''
 define the correlation coefficient loss
 '''
@@ -160,13 +188,17 @@ def Cor_CoeLoss(y_pred, y_target):
 # downsampling/upsampling operations.
 # Code and idea originally from Justin Johnson's architecture.
 # https://github.com/jcjohnson/fast-neural-style/
+# When use_attention=True, mask can be passed to forward(); single-channel input only.
 class ResnetGenerator(nn.Module):
-    def __init__(self, input_nc, output_nc, ngf=64, norm_layer=nn.BatchNorm3d, use_dropout=False, n_blocks=6, padding_type='reflect'):
+    def __init__(self, input_nc, output_nc, ngf=64, norm_layer=nn.BatchNorm3d, use_dropout=False, n_blocks=6, padding_type='reflect', use_attention=False, attention_strength=1.0):
         assert(n_blocks >= 0)
         super(ResnetGenerator, self).__init__()
         self.input_nc = input_nc
         self.output_nc = output_nc
         self.ngf = ngf
+        self.use_attention = use_attention
+        if use_attention:
+            self.attention = MaskAttention3D(strength=attention_strength)
         if type(norm_layer) == functools.partial:
             use_bias = norm_layer.func == nn.InstanceNorm3d
         else:
@@ -200,12 +232,15 @@ class ResnetGenerator(nn.Module):
                       nn.ReLU(True)]
         model += [nn.ReplicationPad3d(3)]
         model += [nn.Conv3d(ngf, output_nc, kernel_size=7, padding=0)]
-        model += [nn.Tanh()]
 
-        self.model = nn.Sequential(*model)
+        self.body = nn.Sequential(*model)
+        self.tanh = nn.Tanh()
 
-    def forward(self, input):
-        return self.model(input)
+    def forward(self, input, mask=None):
+        feat = self.body(input)
+        if self.use_attention and mask is not None:
+            feat = self.attention(feat, mask)
+        return self.tanh(feat)
 
 
 # Define a resnet block

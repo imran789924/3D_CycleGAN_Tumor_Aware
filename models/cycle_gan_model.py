@@ -60,6 +60,8 @@ class CycleGANModel(BaseModel):
                                 help='weight for correlation coefficient loss (A -> B)')
             parser.add_argument('--lambda_co_B', type=float, default=2,
                                 help='weight for correlation coefficient loss (B -> A )')
+            parser.add_argument('--use_attention', action='store_true', help='use mask attention in generator (input must have 2 channels: image, mask)')
+            parser.add_argument('--attention_strength', type=float, default=1.0, help='strength of mask attention modulation when use_attention is set')
 
         return parser
 
@@ -111,10 +113,14 @@ class CycleGANModel(BaseModel):
         # load/define networks
         # The naming conversion is different from those used in the paper
         # Code (paper): G_A (G), G_B (F), D_A (D_Y), D_B (D_X)
-        self.netG_A = networks3D.define_G(opt.input_nc, opt.output_nc, opt.ngf, opt.netG, opt.norm,   # nc number channels
-                                        not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids)
+        use_att = getattr(opt, 'use_attention', False)
+        att_strength = getattr(opt, 'attention_strength', 1.0)
+        self.netG_A = networks3D.define_G(opt.input_nc, opt.output_nc, opt.ngf, opt.netG, opt.norm,
+                                        not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids,
+                                        use_attention=use_att, attention_strength=att_strength)
         self.netG_B = networks3D.define_G(opt.output_nc, opt.input_nc, opt.ngf, opt.netG, opt.norm,
-                                        not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids)
+                                        not opt.no_dropout, opt.init_type, opt.init_gain, self.gpu_ids,
+                                        use_attention=use_att, attention_strength=att_strength)
 
         if self.isTrain:
             use_sigmoid = opt.no_lsgan
