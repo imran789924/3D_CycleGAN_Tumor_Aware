@@ -62,6 +62,7 @@ class CycleGANModel(BaseModel):
                                 help='weight for correlation coefficient loss (B -> A )')
             parser.add_argument('--use_attention', action='store_true', help='use mask attention in generator (input must have 2 channels: image, mask)')
             parser.add_argument('--attention_strength', type=float, default=1.0, help='strength of mask attention modulation when use_attention is set')
+            parser.add_argument('--lambda_tumor', type=float, default=0.0, help='weight for tumor prediction loss (UNet on fake_B vs ground-truth mask). Requires mask_dir and unet_checkpoint.')
 
         return parser
 
@@ -70,6 +71,8 @@ class CycleGANModel(BaseModel):
 
         # specify the training losses you want to print out. The program will call base_model.get_current_losses
         self.loss_names = ['D_A', 'G_A', 'cycle_A', 'idt_A', 'D_B', 'G_B', 'cycle_B', 'idt_B']
+        if getattr(opt, 'lambda_tumor', 0.0) > 0:
+            self.loss_names.append('tumor')
         # self.loss_names = ['D_A', 'G_A', 'cycle_A', 'cor_coe_GA', 'D_B', 'G_B', 'cycle_B', 'cor_coe_GB']
         # specify the images you want to save/display. The program will call base_model.get_current_visuals
         visual_names_A = ['real_A', 'fake_B', 'rec_A']
@@ -101,6 +104,7 @@ class CycleGANModel(BaseModel):
                 p.requires_grad = False
             self.netSeg.eval()
             visual_names_A.append('tumor_pred_B')
+            visual_names_A.append('mask_B')  # ground-truth mask for comparison with tumor_pred_B
             print('Loaded frozen tumor UNet from', opt.unet_checkpoint)
 
         self.visual_names = visual_names_A + visual_names_B
@@ -149,7 +153,10 @@ class CycleGANModel(BaseModel):
         AtoB = self.opt.which_direction == 'AtoB'
         self.real_A = input[0 if AtoB else 1].to(self.device)
         self.real_B = input[1 if AtoB else 0].to(self.device)
-        # self.image_paths = input['A_paths' if AtoB else 'B_paths']
+        # Optional ground-truth tumor mask (same index as real_B; used for tumor loss when lambda_tumor > 0)
+        self.mask_B = None
+        if len(input) >= 3 and isinstance(input[2], torch.Tensor):
+            self.mask_B = input[2].to(self.device)
 
     def forward(self):
         self.fake_B = self.netG_A(self.real_A)
@@ -158,10 +165,14 @@ class CycleGANModel(BaseModel):
         self.fake_A = self.netG_B(self.real_B)
         self.rec_B = self.netG_A(self.fake_A)
 
-        # Frozen UNet: predict tumor mask on fake_B (for monitoring or future loss)
+        # Frozen UNet: predict tumor mask on fake_B (for monitoring and optional tumor loss)
+        use_tumor_loss = getattr(self.opt, 'lambda_tumor', 0.0) > 0 and self.mask_B is not None
         if self.netSeg is not None:
-            with torch.no_grad():
-                self.tumor_pred_B = self.netSeg(self.fake_B)
+            if use_tumor_loss:
+                self.tumor_pred_B = self.netSeg(self.fake_B)  # keep grad for backward_G
+            else:
+                with torch.no_grad():
+                    self.tumor_pred_B = self.netSeg(self.fake_B)
 
     def backward_D_basic(self, netD, real, fake):
         # Real
@@ -226,8 +237,17 @@ class CycleGANModel(BaseModel):
         self.loss_cor_coe_GB = networks3D.Cor_CoeLoss(self.fake_A,
                                                     self.real_B) * lambda_co_B  # fake mr & real ct; Evaluate the Generator of mr(G_B)
 
+        # Tumor prediction loss (frozen UNet on fake_B vs ground-truth mask)
+        lambda_tumor = getattr(self.opt, 'lambda_tumor', 0.0)
+        if lambda_tumor > 0 and self.netSeg is not None and self.mask_B is not None:
+            self.loss_tumor = torch.nn.functional.binary_cross_entropy(self.tumor_pred_B, self.mask_B) * lambda_tumor
+        else:
+            self.loss_tumor = 0.0
+
         # combined loss
         self.loss_G = self.loss_G_A + self.loss_G_B + self.loss_cycle_A + self.loss_cycle_B + self.loss_idt_A + self.loss_idt_B
+        if isinstance(self.loss_tumor, torch.Tensor):
+            self.loss_G = self.loss_G + self.loss_tumor
         # self.loss_G = self.loss_G_A + self.loss_G_B + self.loss_cycle_A + self.loss_cycle_B + self.loss_idt_A + self.loss_idt_B + self.loss_cor_coe_GA + self.loss_cor_coe_GB
         self.loss_G.backward()
 

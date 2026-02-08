@@ -35,14 +35,14 @@ class Down(nn.Module):
 
 
 class Up(nn.Module):
-    def __init__(self, in_ch, out_ch):
+    """Upsample x1 and concat with skip x2; then conv. in_ch = x1 channels, skip_ch = x2 channels, out_ch = output channels."""
+    def __init__(self, in_ch, skip_ch, out_ch):
         super().__init__()
         self.up = nn.ConvTranspose3d(in_ch, in_ch // 2, kernel_size=2, stride=2)
-        self.conv = DoubleConv(in_ch, out_ch)
+        self.conv = DoubleConv(in_ch // 2 + skip_ch, out_ch)
 
     def forward(self, x1, x2):
         x1 = self.up(x1)
-        # handle size mismatch (e.g. odd dimensions)
         diff = [x2.size(i) - x1.size(i) for i in range(2, 5)]
         x1 = nn.functional.pad(x1, [diff[2] // 2, diff[2] - diff[2] // 2,
                                     diff[1] // 2, diff[1] - diff[1] // 2,
@@ -71,11 +71,11 @@ class UNet3D(nn.Module):
         self.bottleneck = DoubleConv(features[-1], features[-1] * 2)
         self.pool = nn.MaxPool3d(2)
 
-        # Decoder: Up(in_ch, out_ch) where in_ch = 2 * skip_ch (concat)
-        self.decoder.append(Up(features[-1] * 2, features[-2]))
-        self.decoder.append(Up(features[-2] * 2, features[-3]))
-        self.decoder.append(Up(features[-3] * 2, features[-4]))
-        self.decoder.append(Up(features[0] * 2, features[0]))
+        # Decoder: Up(x1_ch, skip_ch, out_ch) — x1 from bottleneck/prev, skip from encoder (reversed order)
+        self.decoder.append(Up(features[-1] * 2, features[-1], features[-1]))   # 512, skip 256 -> 256
+        self.decoder.append(Up(features[-1], features[-2], features[-2]))       # 256, skip 128 -> 128
+        self.decoder.append(Up(features[-2], features[-3], features[-3]))       # 128, skip 64 -> 64
+        self.decoder.append(Up(features[-3], features[-4], features[-4]))      # 64, skip 32 -> 32
 
         self.final = nn.Conv3d(features[0], out_channels, 1)
         self.sigmoid = nn.Sigmoid()

@@ -1,3 +1,43 @@
+python train.py \
+  --name test_my_cyclegan_tumor_segLoss_noIdt \
+  --data_path ./Data_folder/train \
+  --mask_dir ./Data_folder/train/images_mask \
+  --unet_checkpoint ./unet_tumor_segmentation/checkpoints/epoch_20.pth \
+  --lambda_tumor 0.5 \
+  --batch_size 1 \
+  --niter 200 \
+  --niter_decay 200 \
+  --gpu_ids 0 \
+  --use_attention --attention_strength 1.0 \
+  --lambda_tumor 50 \
+  --mask_dir Data_folder/train/images_mask \
+  --ngf 32 --ndf 32 --lambda_identity 0 
+
+
+
+python test.py \
+  --name my_cyclegan \
+  --image ./Data_folder/test/images/0.nii.gz \
+  --result ./Data_folder/test/images/result_0.nii.gz \
+  --stride_inplane 32 \
+  --stride_layer 32 \
+  --gpu_ids 0
+
+
+for i in 0 1 2; do
+  python test.py \
+    --name my_cyclegan \
+    --image ./Data_folder/test/images/${i}.nii.gz \
+    --result ./Data_folder/test/images/result_${i}.nii.gz \
+    --stride_inplane 32 \
+    --stride_layer 32 \
+    --gpu_ids 0
+done
+
+
+
+
+
 # 3D-CycleGan-Pytorch-Medical-Imaging-Translation
 
 Pytorch pipeline for 3D image domain translation using Cycle-Generative-Adversarial-networks, without paired examples. By writing this I took as reference:

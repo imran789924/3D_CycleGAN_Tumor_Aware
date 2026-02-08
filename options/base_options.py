@@ -15,7 +15,7 @@ class BaseOptions():
         parser.add_argument('--mask_dir', type=str, default='', help='Directory containing tumor segmentation masks (e.g. .../Data_folder/train/images_mask). Used when loading pretrained UNet for tumor prediction on fake_B.')
         parser.add_argument('--unet_checkpoint', type=str, default='', help='Path to pretrained 3D UNet checkpoint for tumor segmentation (frozen). If set, UNet runs on fake_B to predict tumor mask.')
         parser.add_argument('--batch_size', type=int, default=2, help='input batch size')
-        parser.add_argument('--patch_size', default=[128, 128, 64], help='Size of the patches extracted from the image')
+        parser.add_argument('--patch_size', default=[192, 192, 64], help='Size of the patches extracted from the image')
         parser.add_argument('--input_nc', type=int, default=1, help='# of input image channels')
         parser.add_argument('--output_nc', type=int, default=1, help='# of output image channels')
         parser.add_argument('--resample', default=False, help='Decide or not to rescale the images to a new resolution')
@@ -99,9 +99,8 @@ class BaseOptions():
 
         self.print_options(opt)
 
-        # set gpu ids
-        str_ids = list(opt.gpu_ids)
-        str_ids.remove(',')
+        # set gpu ids (e.g. '0' or '0,1,2')
+        str_ids = [s.strip() for s in str(opt.gpu_ids).split(',') if s.strip()]
         opt.gpu_ids = []
         for str_id in str_ids:
             id = int(str_id)

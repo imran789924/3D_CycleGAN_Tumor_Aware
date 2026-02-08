@@ -5,16 +5,18 @@ Saves metrics to checkpoint_dir/metrics.txt.
 import os
 import sys
 
-if __name__ == '__main__':
-    _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    if _root not in sys.path:
-        sys.path.insert(0, _root)
+_unet_dir = os.path.dirname(os.path.abspath(__file__))
+if _unet_dir not in sys.path:
+    sys.path.insert(0, _unet_dir)
+_root = os.path.dirname(_unet_dir)
+if _root not in sys.path:
+    sys.path.insert(0, _root)
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from options import parse_args
+from unet_options import parse_args
 from dataset import TumorSegDataset
 from model import build_unet
 from metrics import compute_metrics_batch

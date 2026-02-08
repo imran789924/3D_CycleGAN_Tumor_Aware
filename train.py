@@ -9,6 +9,25 @@ from models import create_model
 from utils.visualizer import Visualizer
 from utils.save_slices import save_epoch_slices
 from test import inference
+from torch.utils.data.dataloader import default_collate
+
+
+def collate_optional_mask(batch):
+    """Collate (image, label) or (image, label, mask). If mask is None for all, third element is None."""
+    if not batch:
+        return default_collate(batch)
+    first = batch[0]
+    if len(first) == 2:
+        return default_collate(batch)
+    # len == 3: (image, label, mask or None)
+    imgs = default_collate([b[0] for b in batch])
+    labels = default_collate([b[1] for b in batch])
+    masks = [b[2] for b in batch]
+    if all(m is None for m in masks):
+        return imgs, labels, None
+    masks = default_collate(masks)
+    return imgs, labels, masks
+
 
 if __name__ == '__main__':
 
@@ -24,9 +43,10 @@ if __name__ == '__main__':
                 NiftiDataset.RandomCrop((opt.patch_size[0], opt.patch_size[1], opt.patch_size[2]), opt.drop_ratio, min_pixel),
                 ]
 
-    train_set = NifitDataSet(opt.data_path, which_direction='AtoB', transforms=trainTransforms, shuffle_labels=True, train=True)
+    mask_dir = getattr(opt, 'mask_dir', '') or ''
+    train_set = NifitDataSet(opt.data_path, which_direction='AtoB', transforms=trainTransforms, shuffle_labels=True, train=True, mask_dir=mask_dir)
     print('lenght train list:', len(train_set))
-    train_loader = DataLoader(train_set, batch_size=opt.batch_size, shuffle=True, num_workers=opt.workers, pin_memory=True)  # Here are then fed to the network with a defined batch size
+    train_loader = DataLoader(train_set, batch_size=opt.batch_size, shuffle=True, num_workers=opt.workers, pin_memory=True, collate_fn=collate_optional_mask)  # collate handles (img, label) or (img, label, mask)
 
     # -----------------------------------------------------
     model = create_model(opt)  # creation of the model

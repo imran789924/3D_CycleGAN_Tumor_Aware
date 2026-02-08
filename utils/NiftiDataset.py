@@ -426,7 +426,8 @@ class NifitDataSet(torch.utils.data.Dataset):
                  transforms=None,
                  shuffle_labels=False,
                  train=False,
-                 test=False):
+                 test=False,
+                 mask_dir=''):
 
         # Init membership variables
         self.data_path = data_path
@@ -434,6 +435,13 @@ class NifitDataSet(torch.utils.data.Dataset):
         self.labels_list = lstFiles(os.path.join(data_path, 'labels'))
         self.images_size = len(self.images_list)
         self.labels_size = len(self.labels_list)
+        self.mask_dir = mask_dir
+        if mask_dir and os.path.isdir(mask_dir):
+            self.masks_list = lstFiles(mask_dir)
+            assert len(self.masks_list) == len(self.labels_list), \
+                'mask_dir must have same number of files as labels (got %d vs %d)' % (len(self.masks_list), len(self.labels_list))
+        else:
+            self.masks_list = []
 
         self.which_direction = which_direction
         self.transforms = transforms
@@ -455,13 +463,12 @@ class NifitDataSet(torch.utils.data.Dataset):
         data_path = self.images_list[index]
 
         if self.shuffle_labels is True:
-
             index_B = random.randint(0, self.labels_size - 1)
             label_path = self.labels_list[index_B]
-
+            label_index = index_B
         else:
-
             label_path = self.labels_list[index]
+            label_index = index
 
         if self.which_direction == 'AtoB':
 
@@ -505,7 +512,19 @@ class NifitDataSet(torch.utils.data.Dataset):
             label.SetOrigin(image.GetOrigin())
             label.SetSpacing(image.GetSpacing())
 
-        sample = {'image': image, 'label': label}
+        # Optional: load tumor mask (same index as label; same augmentation applied in transforms)
+        if self.masks_list:
+            mask_path = self.masks_list[label_index]
+            mask_sitk = self.read_image(mask_path)
+            mask_np = sitk.GetArrayFromImage(mask_sitk)
+            mask_np = (mask_np > 0).astype(np.float32)
+            mask_sitk = sitk.GetImageFromArray(mask_np)
+            mask_sitk.SetDirection(label.GetDirection())
+            mask_sitk.SetOrigin(label.GetOrigin())
+            mask_sitk.SetSpacing(label.GetSpacing())
+            sample = {'image': image, 'label': label, 'mask': mask_sitk}
+        else:
+            sample = {'image': image, 'label': label}
 
         if self.transforms:  # apply the transforms to image and label (normalization, resampling, patches)
             for transform in self.transforms:
@@ -528,7 +547,11 @@ class NifitDataSet(torch.utils.data.Dataset):
         image_np = image_np[np.newaxis, :, :, :]
         label_np = label_np[np.newaxis, :, :, :]
 
-        return torch.from_numpy(image_np), torch.from_numpy(label_np)  # this is the final output to feed the network
+        if 'mask' in sample:
+            mask_np = np.transpose(sitk.GetArrayFromImage(sample['mask']), (2, 1, 0))
+            mask_np = (mask_np > 0.5).astype(np.float32)[np.newaxis, :, :, :]
+            return torch.from_numpy(image_np), torch.from_numpy(label_np), torch.from_numpy(mask_np)
+        return torch.from_numpy(image_np), torch.from_numpy(label_np), None
 
     def __len__(self):
         return len(self.images_list)
@@ -890,6 +913,7 @@ class Resample(object):
 
     def __call__(self, sample):
         image, label = sample['image'], sample['label']
+        mask = sample.get('mask')
 
         new_resolution = self.new_resolution
         check = self.check
@@ -897,11 +921,18 @@ class Resample(object):
         if check is True:
             image = resample_sitk_image(image, spacing=new_resolution, interpolator=_interpolator_image)
             label = resample_sitk_image(label, spacing=new_resolution, interpolator=_interpolator_label)
-
-            return {'image': image, 'label': label}
+            if mask is not None:
+                mask = resample_sitk_image(mask, spacing=new_resolution, interpolator='nearest')
+            out = {'image': image, 'label': label}
+            if mask is not None:
+                out['mask'] = mask
+            return out
 
         if check is False:
-            return {'image': image, 'label': label}
+            out = {'image': image, 'label': label}
+            if mask is not None:
+                out['mask'] = mask
+            return out
 
 
 class Padding(object):
@@ -941,9 +972,13 @@ class Padding(object):
 
     def __call__(self, sample):
         image, label = sample['image'], sample['label']
+        mask = sample.get('mask')
         image = self._pad_to_size(image, self.output_size)
         label = self._pad_to_size(label, self.output_size)
-        return {'image': image, 'label': label}
+        out = {'image': image, 'label': label}
+        if mask is not None:
+            out['mask'] = self._pad_to_size(mask, self.output_size)
+        return out
 
 
 
@@ -1052,20 +1087,25 @@ class RandomCrop(object):
 
     def __call__(self, sample):
         image, label = sample['image'], sample['label']
+        mask_vol = sample.get('mask')
         crop = list(self.output_size)
 
         size_img = list(image.GetSize())
         size_lbl = list(label.GetSize())
-
-        # crop size cannot exceed either image or label size
-        crop = [min(crop[d], size_img[d], size_lbl[d]) for d in range(3)]
+        if mask_vol is not None:
+            size_mask = list(mask_vol.GetSize())
+            crop = [min(crop[d], size_img[d], size_lbl[d], size_mask[d]) for d in range(3)]
+        else:
+            crop = [min(crop[d], size_img[d], size_lbl[d]) for d in range(3)]
 
         # if anything became 0, just return as-is (shouldn't happen if Padding before)
         if min(crop) <= 0:
             return sample
 
-        # allowed start ranges that are valid for BOTH
+        # allowed start ranges that are valid for BOTH (and mask if present)
         max_start = [min(size_img[d] - crop[d], size_lbl[d] - crop[d]) for d in range(3)]
+        if mask_vol is not None:
+            max_start = [min(max_start[d], size_mask[d] - crop[d]) for d in range(3)]
         max_start = [max(0, m) for m in max_start]
 
         thr = sitk.BinaryThresholdImageFilter()
@@ -1073,6 +1113,12 @@ class RandomCrop(object):
         thr.SetUpperThreshold(255)
         thr.SetInsideValue(1)
         thr.SetOutsideValue(0)
+
+        def make_out(im_crop, lbl_crop, m_crop=None):
+            o = {'image': im_crop, 'label': lbl_crop}
+            if m_crop is not None:
+                o['mask'] = m_crop
+            return o
 
         for _ in range(self.max_tries):
             start = [
@@ -1097,14 +1143,15 @@ class RandomCrop(object):
 
             if s < self.min_pixel:
                 if self.drop(self.drop_ratio):
-                    # accept empty crop with some probability
                     image_crop = _safe_roi(image, start, crop)
-                    return {'image': image_crop, 'label': label_crop}
+                    mask_crop = _safe_roi(mask_vol, start, crop) if mask_vol is not None else None
+                    return make_out(image_crop, label_crop, mask_crop)
                 else:
                     continue
             else:
                 image_crop = _safe_roi(image, start, crop)
-                return {'image': image_crop, 'label': label_crop}
+                mask_crop = _safe_roi(mask_vol, start, crop) if mask_vol is not None else None
+                return make_out(image_crop, label_crop, mask_crop)
 
         # fallback: center crop (always valid)
         center_start = [
@@ -1112,9 +1159,12 @@ class RandomCrop(object):
             max(0, (min(size_img[1], size_lbl[1]) - crop[1]) // 2),
             max(0, (min(size_img[2], size_lbl[2]) - crop[2]) // 2),
         ]
+        if mask_vol is not None:
+            center_start = [min(center_start[d], max(0, size_mask[d] - crop[d])) for d in range(3)]
         image_crop = _safe_roi(image, center_start, crop)
         label_crop = _safe_roi(label, center_start, crop)
-        return {'image': image_crop, 'label': label_crop}
+        mask_crop = _safe_roi(mask_vol, center_start, crop) if mask_vol is not None else None
+        return make_out(image_crop, label_crop, mask_crop)
 
 
 
@@ -1127,184 +1177,164 @@ class Augmentation(object):
     def __init__(self):
         self.name = 'Augmentation'
 
+    def _out(self, image, label, mask=None):
+        out = {'image': image, 'label': label}
+        if mask is not None:
+            out['mask'] = mask
+        return out
+
     def __call__(self, sample):
 
         choice = np.random.choice([0, 1, 2, 3, 4, 5, 6, 7])
+        mask = sample.get('mask')
 
         # no augmentation
         if choice == 0:  # no augmentation
-
             image, label = sample['image'], sample['label']
-            return {'image': image, 'label': label}
+            return self._out(image, label, mask)
 
         # Additive Gaussian noise
         if choice == 1:  # Additive Gaussian noise
-
             mean = np.random.uniform(0, 1)
             std = np.random.uniform(0, 2)
             self.noiseFilter = sitk.AdditiveGaussianNoiseImageFilter()
             self.noiseFilter.SetMean(mean)
             self.noiseFilter.SetStandardDeviation(std)
-
             image, label = sample['image'], sample['label']
             image = self.noiseFilter.Execute(image)
             if Segmentation is False:
                 label = self.noiseFilter.Execute(label)
-
-            return {'image': image, 'label': label}
+            return self._out(image, label, mask)
 
         # Recursive Gaussian
         if choice == 2:  # Recursive Gaussian
-
             sigma = np.random.uniform(0, 1.5)
             self.noiseFilter = sitk.RecursiveGaussianImageFilter()
             self.noiseFilter.SetOrder(0)
             self.noiseFilter.SetSigma(sigma)
-
             image, label = sample['image'], sample['label']
             image = self.noiseFilter.Execute(image)
             if Segmentation is False:
-                label = self.noiseFilter.Execute(label)    # comment for segmentation
-
-            return {'image': image, 'label': label}
+                label = self.noiseFilter.Execute(label)
+            return self._out(image, label, mask)
 
         # Random rotation x y z
         if choice == 3:  # Random rotation
-
             theta_x = np.random.randint(-40, 40)
             theta_y = np.random.randint(-40, 40)
             theta_z = np.random.randint(-180, 180)
             image, label = sample['image'], sample['label']
-
-            image = rotation3d_image(image,theta_x,theta_y, theta_z)
-            label = rotation3d_label(label,theta_x,theta_y, theta_z)
-
-            return {'image': image, 'label': label}
+            image = rotation3d_image(image, theta_x, theta_y, theta_z)
+            label = rotation3d_label(label, theta_x, theta_y, theta_z)
+            if mask is not None:
+                mask = rotation3d_label(mask, theta_x, theta_y, theta_z)
+            return self._out(image, label, mask)
 
         # BSpline Deformation
         if choice == 4:  # BSpline Deformation
-
             randomness = 10
-
             assert isinstance(randomness, (int, float))
             if randomness > 0:
                 self.randomness = randomness
             else:
                 raise RuntimeError('Randomness should be non zero values')
-
             image, label = sample['image'], sample['label']
             spline_order = 3
             domain_physical_dimensions = [image.GetSize()[0] * image.GetSpacing()[0],
                                           image.GetSize()[1] * image.GetSpacing()[1],
                                           image.GetSize()[2] * image.GetSpacing()[2]]
-
             bspline = sitk.BSplineTransform(3, spline_order)
             bspline.SetTransformDomainOrigin(image.GetOrigin())
             bspline.SetTransformDomainDirection(image.GetDirection())
             bspline.SetTransformDomainPhysicalDimensions(domain_physical_dimensions)
             bspline.SetTransformDomainMeshSize((10, 10, 10))
-
-            # Random displacement of the control points.
             originalControlPointDisplacements = np.random.random(len(bspline.GetParameters())) * self.randomness
             bspline.SetParameters(originalControlPointDisplacements)
-
             image = sitk.Resample(image, bspline)
             label = sitk.Resample(label, bspline)
-            return {'image': image, 'label': label}
+            if mask is not None:
+                mask = sitk.Resample(mask, image, bspline, sitk.sitkNearestNeighbor, 0.0)
+            return self._out(image, label, mask)
 
         # Random flip
         if choice == 5:  # Random flip
-
             axes = np.random.choice([0, 1])
             image, label = sample['image'], sample['label']
-
             image = flipit(image, axes)
             label = flipit(label, axes)
-
-            return {'image': image, 'label': label}
+            if mask is not None:
+                mask = flipit(mask, axes)
+            return self._out(image, label, mask)
 
         # Brightness
         if choice == 6:  # Brightness
-
             image, label = sample['image'], sample['label']
-
             image = brightness(image)
             if Segmentation is False:
                 label = brightness(label)
-
-            return {'image': image, 'label': label}
+            return self._out(image, label, mask)
 
         # Contrast
         if choice == 7:  # Contrast
-
             image, label = sample['image'], sample['label']
-
             image = contrast(image)
             if Segmentation is False:
-                label = contrast(label)             # comment for segmentation
-
-            return {'image': image, 'label': label}
+                label = contrast(label)
+            return self._out(image, label, mask)
 
         # Translate
         if choice == 8:  # translate
-
             image, label = sample['image'], sample['label']
-
             t1 = np.random.randint(-40, 40)
             t2 = np.random.randint(-40, 40)
             offset = [t1, t2]
-
             image = translateit(image, offset)
             label = translateit(label, offset)
-
-            return {'image': image, 'label': label}
+            if mask is not None:
+                mask = translateit(mask, offset, isseg=True)
+            return self._out(image, label, mask)
 
         # Random rotation z
         if choice == 9:  # Random rotation
-
             theta_x = 0
             theta_y = 0
             theta_z = np.random.randint(-180, 180)
             image, label = sample['image'], sample['label']
-
             image = rotation3d_image(image, theta_x, theta_y, theta_z)
             label = rotation3d_label(label, theta_x, theta_y, theta_z)
-
-            return {'image': image, 'label': label}
+            if mask is not None:
+                mask = rotation3d_label(mask, theta_x, theta_y, theta_z)
+            return self._out(image, label, mask)
 
         # Random rotation x
         if choice == 10:  # Random rotation
-
             theta_x = np.random.randint(-40, 40)
             theta_y = 0
             theta_z = 0
             image, label = sample['image'], sample['label']
-
             image = rotation3d_image(image, theta_x, theta_y, theta_z)
             label = rotation3d_label(label, theta_x, theta_y, theta_z)
-
-            return {'image': image, 'label': label}
+            if mask is not None:
+                mask = rotation3d_label(mask, theta_x, theta_y, theta_z)
+            return self._out(image, label, mask)
 
         # Random rotation y
         if choice == 11:  # Random rotation
-
             theta_x = 0
             theta_y = np.random.randint(-40, 40)
             theta_z = 0
             image, label = sample['image'], sample['label']
-
             image = rotation3d_image(image, theta_x, theta_y, theta_z)
             label = rotation3d_label(label, theta_x, theta_y, theta_z)
-
-            return {'image': image, 'label': label}
+            if mask is not None:
+                mask = rotation3d_label(mask, theta_x, theta_y, theta_z)
+            return self._out(image, label, mask)
 
         # histogram gamma
         if choice == 12:
             image, label = sample['image'], sample['label']
-
             image = imadjust(image)
-
-            return {'image': image, 'label': label}
+            return self._out(image, label, mask)
 
 
 class ConfidenceCrop(object):
