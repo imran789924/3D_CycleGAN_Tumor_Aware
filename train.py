@@ -7,6 +7,7 @@ from options.train_options import TrainOptions
 import time
 from models import create_model
 from utils.visualizer import Visualizer
+from utils.save_slices import save_epoch_slices
 from test import inference
 
 if __name__ == '__main__':
@@ -61,6 +62,13 @@ if __name__ == '__main__':
                 model.save_networks('latest')
 
             iter_data_time = time.time()
+
+        # Save middle slices of real_A, fake_B, real_B, fake_A, etc. as PNG for visibility
+        try:
+            visuals = model.get_current_visuals()
+            save_epoch_slices(visuals, model.save_dir, epoch)
+        except Exception as e:
+            print('Warning: could not save epoch slices: %s' % e)
 
         if epoch % opt.save_epoch_freq == 0:
             print('saving the model at the end of epoch %d, iters %d' %
